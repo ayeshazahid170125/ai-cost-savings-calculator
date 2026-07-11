@@ -1,0 +1,6 @@
+date,provider,model,requests,input_tokens,output_tokens
+2026-07-01,Anthropic,claude-sonnet,12000,9600000,5400000
+2026-07-02,Anthropic,claude-sonnet,11500,9200000,5175000
+2026-07-03,Anthropic,claude-sonnet,13200,10560000,5940000
+2026-07-04,Anthropic,claude-sonnet,10800,8640000,4860000
+2026-07-05,Anthropic,claude-sonnet,12500,10000000,5625000
