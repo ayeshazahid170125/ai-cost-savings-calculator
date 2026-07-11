@@ -4,7 +4,6 @@ import { jsPDF } from "jspdf";
 import {
   Bar,
   BarChart,
-  CartesianGrid,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -16,11 +15,12 @@ import {
   BarChart3,
   Brain,
   Calculator,
+  DollarSign,
   Download,
   FileText,
   History,
+  Percent,
   Server,
-  Settings,
   Tag,
   TrendingDown,
   Upload
@@ -34,51 +34,47 @@ const PROVIDERS = {
   "Claude Haiku": { input: 0.25, output: 1.25 }
 };
 
-// Realistic monthly self-hosted infrastructure costs by hardware tier.
-// Mirrors the backend's HARDWARE_TIERS so browser-fallback mode and the
-// live API give consistent, believable numbers (e.g. multi-month
-// break-even instead of an unrealistic <1 month payback).
+// Round 2: hardware tiers no longer carry flat monthly cost guesses.
+// Instead they carry throughput/pricing assumptions used to derive infra
+// cost from actual token volume. Mirrors the backend's HARDWARE_TIERS so
+// browser-fallback mode and the live API give consistent numbers.
 const HARDWARE_TIERS = {
   small: {
     hardware: "1x RTX 4090",
-    gpuCost: 450,
-    hostingCost: 60,
-    storageCost: 25,
-    monitoringCost: 20,
-    maintenanceCost: 150,
+    combinedThroughputTokensPerSec: 150,
+    hourlyGpuRateCombined: 0.8,
     fineTuningCost: 150,
     setupCost: 2500
   },
   medium: {
     hardware: "1x RTX 4090 or L40S",
-    gpuCost: 750,
-    hostingCost: 100,
-    storageCost: 40,
-    monitoringCost: 30,
-    maintenanceCost: 220,
+    combinedThroughputTokensPerSec: 250,
+    hourlyGpuRateCombined: 1.6,
     fineTuningCost: 200,
     setupCost: 3500
   },
   large: {
     hardware: "2x L40S or 1x A100 80GB",
-    gpuCost: 1450,
-    hostingCost: 180,
-    storageCost: 70,
-    monitoringCost: 45,
-    maintenanceCost: 320,
+    combinedThroughputTokensPerSec: 500,
+    hourlyGpuRateCombined: 6.0,
     fineTuningCost: 300,
     setupCost: 5500
   },
   enterprise: {
     hardware: "2-4x A100/H100",
-    gpuCost: 3200,
-    hostingCost: 350,
-    storageCost: 120,
-    monitoringCost: 80,
-    maintenanceCost: 600,
+    combinedThroughputTokensPerSec: 900,
+    hourlyGpuRateCombined: 12.0,
     fineTuningCost: 500,
     setupCost: 9000
   }
+};
+
+// Supporting infra scaled off gpu_cost_auto rather than guessed independently.
+const INFRA_RATIOS = {
+  hostingCost: 0.15,
+  storageCost: 0.05,
+  monitoringCost: 0.05,
+  maintenanceCost: 0.2
 };
 
 const COST_FIELDS = [
@@ -91,25 +87,84 @@ const COST_FIELDS = [
   "setupCost"
 ];
 
+function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+
+// Round 2: primary signal is monthly_tokens (throughput); team_size is
+// only a tie-breaker near a boundary.
 function getHardwareTier(teamSize, monthlyTokens) {
-  if (teamSize <= 20 && monthlyTokens < 25_000_000) return "small";
-  if (teamSize <= 80 && monthlyTokens < 120_000_000) return "medium";
-  if (teamSize <= 300) return "large";
-  return "enterprise";
+  const order = ["small", "medium", "large", "enterprise"];
+  let idx;
+  if (monthlyTokens < 50_000_000) idx = 0;
+  else if (monthlyTokens < 150_000_000) idx = 1;
+  else if (monthlyTokens < 400_000_000) idx = 2;
+  else idx = 3;
+
+  if (teamSize > 300 && idx < 3) idx += 1;
+  else if (teamSize > 80 && idx === 0) idx += 1;
+  return order[idx];
+}
+
+// Derives gpu/hosting/storage/monitoring/maintenance cost from actual
+// token throughput instead of a flat per-tier guess. Also applies the
+// reliability/retry fudge factor before any cost is calculated.
+function computeAutoInfraCosts(values, monthlyTokens) {
+  const tier = getHardwareTier(values.teamSize, monthlyTokens);
+  const defaults = HARDWARE_TIERS[tier];
+  const effectiveSelfHostedTokens = monthlyTokens * values.reliabilityDeratingFactor;
+  const effectiveThroughput =
+    defaults.combinedThroughputTokensPerSec * values.targetGpuUtilization;
+  const requiredGpuHours = effectiveSelfHostedTokens / (effectiveThroughput * 3600);
+  const gpuCostAuto = requiredGpuHours * defaults.hourlyGpuRateCombined;
+
+  return {
+    tier,
+    effectiveSelfHostedTokens,
+    gpuCostAuto,
+    hostingCostAuto: gpuCostAuto * INFRA_RATIOS.hostingCost,
+    storageCostAuto: gpuCostAuto * INFRA_RATIOS.storageCost,
+    monitoringCostAuto: gpuCostAuto * INFRA_RATIOS.monitoringCost,
+    maintenanceCostAuto: gpuCostAuto * INFRA_RATIOS.maintenanceCost,
+    fineTuningDefault: defaults.fineTuningCost,
+    setupDefault: defaults.setupCost
+  };
 }
 
 // Default form values reflect the "large" tier, since the default
 // team size (25) and usage (300k requests/month) fall into that
 // bracket — keeps the first thing a visitor sees realistic.
-const DEFAULTS = {
-  companyName: "Acme Support",
-  teamSize: 25,
-  provider: "Claude Sonnet",
-  monthlyRequests: 300000,
-  inputTokens: 800,
-  outputTokens: 450,
-  ...HARDWARE_TIERS.large
-};
+function buildDefaults() {
+  const base = {
+    companyName: "Acme Support",
+    teamSize: 25,
+    provider: "Claude Sonnet",
+    monthlyRequests: 300000,
+    inputTokens: 800,
+    outputTokens: 450,
+    infraCostingMode: "auto",
+    gpuBillingMode: "cloud_rental",
+    fineTuningBillingMode: "monthly",
+    targetGpuUtilization: 0.4,
+    reliabilityDeratingFactor: 1.2
+  };
+  const monthlyTokens =
+    base.monthlyRequests * base.inputTokens + base.monthlyRequests * base.outputTokens;
+  const auto = computeAutoInfraCosts(base, monthlyTokens);
+
+  return {
+    ...base,
+    gpuCost: round2(auto.gpuCostAuto),
+    hostingCost: round2(auto.hostingCostAuto),
+    storageCost: round2(auto.storageCostAuto),
+    monitoringCost: round2(auto.monitoringCostAuto),
+    maintenanceCost: round2(auto.maintenanceCostAuto),
+    fineTuningCost: auto.fineTuningDefault,
+    setupCost: auto.setupDefault
+  };
+}
+
+const DEFAULTS = buildDefaults();
 
 const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
@@ -120,6 +175,13 @@ function currency(value) {
     maximumFractionDigits: 0
   }).format(Number.isFinite(value) ? value : 0);
 }
+
+const TIER_LABELS = {
+  small: "Small (under 50M tokens/month)",
+  medium: "Medium (50M–150M tokens/month)",
+  large: "Large (150M–400M tokens/month)",
+  enterprise: "Enterprise (over 400M tokens/month)"
+};
 
 const MODEL_BY_TIER = {
   small: {
@@ -144,11 +206,11 @@ const MODEL_BY_TIER = {
   }
 };
 
-function recommendModel(teamSize, monthlyTokens) {
-  const tier = getHardwareTier(teamSize, monthlyTokens);
+function recommendModel(tier) {
   return {
     ...MODEL_BY_TIER[tier],
-    hardware: HARDWARE_TIERS[tier].hardware
+    hardware: HARDWARE_TIERS[tier].hardware,
+    tierDriver: "monthly_tokens"
   };
 }
 
@@ -161,34 +223,70 @@ function calculate(values) {
     (monthlyInputTokens / 1_000_000) * pricing.input +
     (monthlyOutputTokens / 1_000_000) * pricing.output;
 
+  const auto = computeAutoInfraCosts(values, monthlyTokens);
+  const useAuto = values.infraCostingMode === "auto";
+
+  const gpuCost = useAuto ? auto.gpuCostAuto : values.gpuCost;
+  const hostingCost = useAuto ? auto.hostingCostAuto : values.hostingCost;
+  const storageCost = useAuto ? auto.storageCostAuto : values.storageCost;
+  const monitoringCost = useAuto ? auto.monitoringCostAuto : values.monitoringCost;
+  const maintenanceCost = useAuto ? auto.maintenanceCostAuto : values.maintenanceCost;
+  const fineTuningCost = values.fineTuningCost;
+  const setupCost = values.setupCost;
+
+  // GPU that's owned (not rented) is capital, not a recurring monthly
+  // line item — it folds into effective_setup_cost instead.
+  const monthlyGpuLine = values.gpuBillingMode === "cloud_rental" ? gpuCost : 0;
+  const monthlyFineTuneCost = values.fineTuningBillingMode === "monthly" ? fineTuningCost : 0;
+
+  const effectiveSetupCost =
+    setupCost +
+    (values.gpuBillingMode === "owned_hardware" ? gpuCost : 0) +
+    (values.fineTuningBillingMode === "one_time" ? fineTuningCost : 0);
+
   const selfHostedCost =
-    values.gpuCost +
-    values.hostingCost +
-    values.storageCost +
-    values.monitoringCost +
-    values.maintenanceCost +
-    values.fineTuningCost;
+    monthlyGpuLine + hostingCost + storageCost + monitoringCost + maintenanceCost + monthlyFineTuneCost;
 
   const monthlySavings = apiCost - selfHostedCost;
   const yearlySavings = monthlySavings * 12;
-  const breakEvenMonths = monthlySavings > 0 ? values.setupCost / monthlySavings : Infinity;
-  const roi = selfHostedCost > 0 ? (monthlySavings / selfHostedCost) * 100 : 0;
+
+  let breakEvenMonths = null;
+  let breakEvenNote = null;
+  if (monthlySavings > 0) {
+    breakEvenMonths = effectiveSetupCost / monthlySavings;
+  } else {
+    breakEvenNote = "Self-hosting is not cost-effective at this usage level.";
+  }
+
+  const annualRoiPercent =
+    effectiveSetupCost > 0 ? ((yearlySavings - effectiveSetupCost) / effectiveSetupCost) * 100 : 0;
+  const monthlyCostEfficiencyRatio = selfHostedCost > 0 ? (monthlySavings / selfHostedCost) * 100 : 0;
 
   return {
     monthlyInputTokens,
     monthlyOutputTokens,
     monthlyTokens,
+    effectiveSelfHostedTokens: auto.effectiveSelfHostedTokens,
     apiCost,
     selfHostedCost,
+    effectiveSetupCost,
     monthlySavings,
     yearlySavings,
     breakEvenMonths,
-    roi,
-    recommendation: recommendModel(values.teamSize, monthlyTokens)
+    breakEvenNote,
+    annualRoiPercent,
+    monthlyCostEfficiencyRatio,
+    costBreakdown: { gpuCost, hostingCost, storageCost, monitoringCost, maintenanceCost, fineTuningCost, setupCost },
+    recommendation: recommendModel(auto.tier)
   };
 }
 
-function toApiPayload(values) {
+function toApiPayload(values, touchedCostFields) {
+  // Only send a cost field as an explicit override if the user actually
+  // edited it. Otherwise send null so the backend derives it itself
+  // (auto-calculated or tier default, per infra_costing_mode).
+  const override = (field) => (touchedCostFields.has(field) ? values[field] : null);
+
   return {
     company_name: values.companyName,
     team_size: values.teamSize,
@@ -196,13 +294,18 @@ function toApiPayload(values) {
     monthly_requests: values.monthlyRequests,
     input_tokens: values.inputTokens,
     output_tokens: values.outputTokens,
-    gpu_cost: values.gpuCost,
-    hosting_cost: values.hostingCost,
-    storage_cost: values.storageCost,
-    monitoring_cost: values.monitoringCost,
-    maintenance_cost: values.maintenanceCost,
-    fine_tuning_cost: values.fineTuningCost,
-    setup_cost: values.setupCost
+    infra_costing_mode: values.infraCostingMode,
+    gpu_billing_mode: values.gpuBillingMode,
+    fine_tuning_billing_mode: values.fineTuningBillingMode,
+    target_gpu_utilization: values.targetGpuUtilization,
+    reliability_derating_factor: values.reliabilityDeratingFactor,
+    gpu_cost: override("gpuCost"),
+    hosting_cost: override("hostingCost"),
+    storage_cost: override("storageCost"),
+    monitoring_cost: override("monitoringCost"),
+    maintenance_cost: override("maintenanceCost"),
+    fine_tuning_cost: override("fineTuningCost"),
+    setup_cost: override("setupCost")
   };
 }
 
@@ -211,12 +314,25 @@ function normalizeApiResult(data) {
     monthlyInputTokens: data.monthly_input_tokens,
     monthlyOutputTokens: data.monthly_output_tokens,
     monthlyTokens: data.monthly_tokens,
+    effectiveSelfHostedTokens: data.effective_self_hosted_tokens,
     apiCost: data.api_cost,
     selfHostedCost: data.self_hosted_cost,
+    effectiveSetupCost: data.effective_setup_cost,
     monthlySavings: data.monthly_savings,
     yearlySavings: data.yearly_savings,
-    breakEvenMonths: data.break_even_months ?? Infinity,
-    roi: data.roi,
+    breakEvenMonths: data.break_even_months,
+    breakEvenNote: data.break_even_note,
+    annualRoiPercent: data.annual_roi_percent,
+    monthlyCostEfficiencyRatio: data.monthly_cost_efficiency_ratio,
+    costBreakdown: {
+      gpuCost: data.cost_breakdown.gpu_cost,
+      hostingCost: data.cost_breakdown.hosting_cost,
+      storageCost: data.cost_breakdown.storage_cost,
+      monitoringCost: data.cost_breakdown.monitoring_cost,
+      maintenanceCost: data.cost_breakdown.maintenance_cost,
+      fineTuningCost: data.cost_breakdown.fine_tuning_cost,
+      setupCost: data.cost_breakdown.setup_cost
+    },
     recommendation: data.recommendation
   };
 }
@@ -354,7 +470,7 @@ function summarizeCsvUsage(text) {
   };
 }
 
-function NumberField({ label, name, value, onChange, prefix = "", suffix = "" }) {
+function NumberField({ label, name, value, onChange, prefix = "", suffix = "", step = "any" }) {
   return (
     <label className="field">
       <span>{label}</span>
@@ -363,6 +479,7 @@ function NumberField({ label, name, value, onChange, prefix = "", suffix = "" })
         <input
           type="number"
           min="0"
+          step={step}
           name={name}
           value={value}
           onChange={onChange}
@@ -381,16 +498,63 @@ function App() {
   // alone so the user's own numbers are never silently overwritten.
   const [touchedCostFields, setTouchedCostFields] = useState(new Set());
   const fallbackResult = useMemo(() => calculate(values), [values]);
+  // Always reflects the auto-derived recommendation (tier, hardware, and
+  // dollar breakdown), regardless of which infra_costing_mode is currently
+  // selected. Used to show a friendly "here's what we estimated for you"
+  // summary even while the user is in manual mode.
+  const autoInfra = useMemo(() => {
+    const monthlyTokens =
+      values.monthlyRequests * values.inputTokens + values.monthlyRequests * values.outputTokens;
+    const auto = computeAutoInfraCosts(values, monthlyTokens);
+    return {
+      tier: auto.tier,
+      monthlyTokensForDisplay: monthlyTokens,
+      gpuCost: round2(auto.gpuCostAuto),
+      hostingCost: round2(auto.hostingCostAuto),
+      storageCost: round2(auto.storageCostAuto),
+      monitoringCost: round2(auto.monitoringCostAuto),
+      maintenanceCost: round2(auto.maintenanceCostAuto),
+      fineTuningCost: auto.fineTuningDefault,
+      setupCost: auto.setupDefault,
+      recommendation: recommendModel(auto.tier)
+    };
+  }, [
+    values.teamSize,
+    values.monthlyRequests,
+    values.inputTokens,
+    values.outputTokens,
+    values.reliabilityDeratingFactor,
+    values.targetGpuUtilization
+  ]);
   const [apiResult, setApiResult] = useState(null);
   const [apiStatus, setApiStatus] = useState("Calculating with backend...");
   const [uploadSummary, setUploadSummary] = useState("");
+  // Billing modes default to the conservative options (cloud_rental,
+  // monthly) so numbers aren't accidentally optimistic. Per README's
+  // Known Limitations, the user still needs to explicitly confirm these
+  // match their real arrangement before the figures should be trusted
+  // for a client-facing report — wrong mode silently skews break-even/ROI.
+  const [billingConfirmed, setBillingConfirmed] = useState(false);
+  // Most users (e.g. a compliance/ops person filling this in) don't know
+  // GPU throughput or hourly cloud rates. Auto mode already derives every
+  // infra dollar figure from usage + recommended tier; these toggles just
+  // control whether the underlying technical assumptions are shown at all.
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const result = apiResult || fallbackResult;
 
   useEffect(() => {
     const monthlyTokens =
       values.monthlyRequests * values.inputTokens + values.monthlyRequests * values.outputTokens;
-    const tier = getHardwareTier(values.teamSize, monthlyTokens);
-    const recommended = HARDWARE_TIERS[tier];
+    const auto = computeAutoInfraCosts(values, monthlyTokens);
+    const recommended = {
+      gpuCost: round2(auto.gpuCostAuto),
+      hostingCost: round2(auto.hostingCostAuto),
+      storageCost: round2(auto.storageCostAuto),
+      monitoringCost: round2(auto.monitoringCostAuto),
+      maintenanceCost: round2(auto.maintenanceCostAuto),
+      fineTuningCost: auto.fineTuningDefault,
+      setupCost: auto.setupDefault
+    };
 
     setValues((current) => {
       const next = { ...current };
@@ -404,7 +568,14 @@ function App() {
       return changed ? next : current;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [values.teamSize, values.monthlyRequests, values.inputTokens, values.outputTokens]);
+  }, [
+    values.teamSize,
+    values.monthlyRequests,
+    values.inputTokens,
+    values.outputTokens,
+    values.reliabilityDeratingFactor,
+    values.targetGpuUtilization
+  ]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -415,7 +586,7 @@ function App() {
         const response = await fetch(`${API_URL}/calculate`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(toApiPayload(values)),
+          body: JSON.stringify(toApiPayload(values, touchedCostFields)),
           signal: controller.signal
         });
 
@@ -438,7 +609,7 @@ function App() {
       clearTimeout(timeout);
       controller.abort();
     };
-  }, [values]);
+  }, [values, touchedCostFields]);
 
   const comparisonData = [
     { name: "Current API", cost: Math.round(result.apiCost) },
@@ -450,18 +621,23 @@ function App() {
     return {
       month: `M${month}`,
       api: Math.round(result.apiCost * month),
-      selfHosted: Math.round(values.setupCost + result.selfHostedCost * month)
+      selfHosted: Math.round(result.effectiveSetupCost + result.selfHostedCost * month)
     };
   });
+
+  const STRING_FIELDS = ["companyName", "provider", "infraCostingMode", "gpuBillingMode", "fineTuningBillingMode"];
 
   function handleChange(event) {
     const { name, value } = event.target;
     if (COST_FIELDS.includes(name)) {
       setTouchedCostFields((current) => new Set(current).add(name));
     }
+    if (name === "gpuBillingMode" || name === "fineTuningBillingMode") {
+      setBillingConfirmed(false);
+    }
     setValues((current) => ({
       ...current,
-      [name]: name === "companyName" || name === "provider" ? value : Number(value)
+      [name]: STRING_FIELDS.includes(name) ? value : Number(value)
     }));
   }
 
@@ -499,9 +675,10 @@ function App() {
       month: "long",
       day: "numeric"
     });
-    const breakEven = Number.isFinite(result.breakEvenMonths)
-      ? `${result.breakEvenMonths.toFixed(1)} months`
-      : "No break-even with current assumptions";
+    const breakEven =
+      result.breakEvenMonths != null
+        ? `${result.breakEvenMonths.toFixed(1)} months`
+        : result.breakEvenNote || "Not cost-effective at this usage level";
 
     doc.setFillColor(15, 23, 42);
     doc.rect(0, 0, 210, 34, "F");
@@ -534,7 +711,8 @@ function App() {
       ["Self-hosted cost", currency(result.selfHostedCost)],
       ["Monthly savings", currency(result.monthlySavings)],
       ["Yearly savings", currency(result.yearlySavings)],
-      ["ROI", `${result.roi.toFixed(1)}%`],
+      ["Annual ROI", `${result.annualRoiPercent.toFixed(1)}%`],
+      ["Monthly cost efficiency ratio", `${result.monthlyCostEfficiencyRatio.toFixed(1)}%`],
       ["Break-even", breakEven],
       ["Recommended model", result.recommendation.model],
       ["Recommended hardware", result.recommendation.hardware],
@@ -574,7 +752,22 @@ function App() {
     doc.text(
       "Assumptions are estimates for planning. Final infrastructure costs depend on model size, latency target, cloud provider, and DevOps ownership.",
       14,
-      284
+      274
+    );
+    doc.setFont("helvetica", "bold");
+    doc.text(
+      "Scope: estimate reflects infrastructure costs only; excludes engineering and operational overhead.",
+      14,
+      280
+    );
+    doc.setFont("helvetica", billingConfirmed ? "normal" : "bold");
+    doc.setTextColor(billingConfirmed ? 100 : 180, billingConfirmed ? 116 : 83, billingConfirmed ? 139 : 9);
+    doc.text(
+      billingConfirmed
+        ? "Billing modes (GPU / fine-tuning) were confirmed by the preparer before this report was generated."
+        : "Note: GPU/fine-tuning billing modes were NOT confirmed by the preparer — verify before sharing.",
+      14,
+      286
     );
 
     const fileName = `${values.companyName.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-ai-cost-report.pdf`;
@@ -583,37 +776,35 @@ function App() {
 
   return (
     <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <Brain size={24} />
-          <div>
-            <strong>AI CostOps</strong>
-            <span>Calculator</span>
+      <header className="topbar">
+        <div className="topbarInner">
+          <div className="brand">
+            <Brain size={22} />
+            <div>
+              <strong>AI CostOps</strong>
+              <span>Calculator</span>
+            </div>
           </div>
+          <nav className="nav">
+            <a className="active" href="#dashboard">
+              <BarChart3 size={16} />
+              Overview
+            </a>
+            <a href="#pricing">
+              <Tag size={16} />
+              Pricing
+            </a>
+            <a href="#history">
+              <History size={16} />
+              History
+            </a>
+            <a href="#reports">
+              <FileText size={16} />
+              Reports
+            </a>
+          </nav>
         </div>
-        <nav className="nav">
-          <a className="active" href="#dashboard">
-            <BarChart3 size={18} />
-            Dashboard
-          </a>
-          <a href="#reports">
-            <FileText size={18} />
-            Reports
-          </a>
-          <a href="#history">
-            <History size={18} />
-            History
-          </a>
-          <a href="#pricing">
-            <Tag size={18} />
-            Pricing
-          </a>
-          <a href="#settings">
-            <Settings size={18} />
-            Settings
-          </a>
-        </nav>
-      </aside>
+      </header>
 
       <div className="app">
       <section id="dashboard" className="hero">
@@ -638,9 +829,9 @@ function App() {
           <div>
             <span>Break-even</span>
             <strong>
-              {Number.isFinite(result.breakEvenMonths)
+              {result.breakEvenMonths != null
                 ? `${result.breakEvenMonths.toFixed(1)} months`
-                : "No savings yet"}
+                : "Not cost-effective"}
             </strong>
           </div>
         </div>
@@ -702,45 +893,279 @@ function App() {
         <section className="panel">
           <div className="sectionTitle">
             <Server size={20} />
-            <h2>Self-hosted Estimate</h2>
+            <h2>Recommended Infrastructure</h2>
           </div>
           <p style={{ marginTop: "-8px", marginBottom: "16px", color: "#64748b", fontSize: "0.85rem", lineHeight: 1.5 }}>
-            These auto-fill based on the recommended hardware tier for your team size and
-            usage. Edit any field to override it with your own numbers.
+            You don't need to know GPU pricing or server specs — this is
+            generated automatically from your company usage on the left.
           </p>
 
-          <NumberField label="GPU cost" name="gpuCost" value={values.gpuCost} onChange={handleChange} prefix="$" />
-          <NumberField label="Hosting / electricity" name="hostingCost" value={values.hostingCost} onChange={handleChange} prefix="$" />
-          <NumberField label="Storage" name="storageCost" value={values.storageCost} onChange={handleChange} prefix="$" />
-          <NumberField label="Monitoring" name="monitoringCost" value={values.monitoringCost} onChange={handleChange} prefix="$" />
-          <NumberField label="Maintenance" name="maintenanceCost" value={values.maintenanceCost} onChange={handleChange} prefix="$" />
-          <NumberField label="Fine-tuning amortized" name="fineTuningCost" value={values.fineTuningCost} onChange={handleChange} prefix="$" />
-          <NumberField label="One-time setup cost" name="setupCost" value={values.setupCost} onChange={handleChange} prefix="$" />
+          <div
+            style={{
+              marginBottom: "16px",
+              padding: "16px",
+              border: "1px solid #bfdbfe",
+              borderRadius: "8px",
+              background: "#eff6ff"
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                marginBottom: "8px"
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <Server size={16} color="#1d4ed8" />
+                <strong style={{ fontSize: "0.95rem", color: "#1e3a8a" }}>
+                  {autoInfra.recommendation.model}
+                </strong>
+              </div>
+              <span
+                style={{
+                  fontSize: "0.7rem",
+                  fontWeight: 800,
+                  color: "#065f46",
+                  background: "#d1fae5",
+                  padding: "3px 9px",
+                  borderRadius: "999px",
+                  whiteSpace: "nowrap"
+                }}
+              >
+                ✓ Auto Generated
+              </span>
+            </div>
+            <p style={{ margin: "0 0 12px", fontSize: "0.83rem", color: "#334155", lineHeight: 1.5 }}>
+              Based on your usage, we recommend {autoInfra.recommendation.hardware}. Every
+              cost below is calculated automatically — nothing to fill in.
+            </p>
+            <div
+              style={{
+                marginBottom: "12px",
+                padding: "10px 12px",
+                border: "1px dashed #93c5fd",
+                borderRadius: "6px",
+                background: "#fff",
+                fontSize: "0.78rem",
+                color: "#475569",
+                lineHeight: 1.6
+              }}
+            >
+              <strong style={{ color: "#1e3a8a" }}>Why this recommendation: </strong>
+              {values.teamSize} team members × {values.monthlyRequests.toLocaleString("en-US")}{" "}
+              requests/month × ({values.inputTokens} in + {values.outputTokens} out tokens) ≈{" "}
+              {(autoInfra.monthlyTokensForDisplay / 1_000_000).toFixed(1)}M tokens/month, which
+              falls in the <strong>{TIER_LABELS[autoInfra.tier]}</strong> tier. A reliability
+              factor of {values.reliabilityDeratingFactor}x is applied on top of that, assuming
+              the self-hosted model needs that much more effective compute to match your
+              current provider's reliability.
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+                gap: "10px"
+              }}
+            >
+              {[
+                ["GPU", autoInfra.gpuCost],
+                ["Hosting", autoInfra.hostingCost],
+                ["Storage", autoInfra.storageCost],
+                ["Monitoring", autoInfra.monitoringCost],
+                ["Maintenance", autoInfra.maintenanceCost],
+                ["Fine-tuning", autoInfra.fineTuningCost],
+                ["Setup (one-time)", autoInfra.setupCost]
+              ].map(([label, value]) => (
+                <div
+                  key={label}
+                  style={{
+                    background: "#fff",
+                    border: "1px solid #dbeafe",
+                    borderRadius: "6px",
+                    padding: "8px 10px"
+                  }}
+                >
+                  <div style={{ fontSize: "0.72rem", color: "#64748b", fontWeight: 700 }}>{label}</div>
+                  <div style={{ fontSize: "0.95rem", fontWeight: 800, color: "#1e3a8a" }}>
+                    {currency(value)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <label className="field">
+            <span>GPU billing mode</span>
+            <select name="gpuBillingMode" value={values.gpuBillingMode} onChange={handleChange}>
+              <option value="cloud_rental">Cloud rental (recurring monthly)</option>
+              <option value="owned_hardware">Owned hardware (one-time, in setup cost)</option>
+            </select>
+          </label>
+
+          <label className="field">
+            <span>Fine-tuning billing mode</span>
+            <select name="fineTuningBillingMode" value={values.fineTuningBillingMode} onChange={handleChange}>
+              <option value="monthly">Recurring monthly</option>
+              <option value="one_time">One-time (in setup cost)</option>
+            </select>
+          </label>
+
+          {!billingConfirmed && (
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: "10px",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: "14px",
+                padding: "12px 14px",
+                border: "1px solid #fcd34d",
+                borderRadius: "8px",
+                background: "#fffbeb"
+              }}
+            >
+              <span style={{ fontSize: "0.85rem", color: "#92400e", lineHeight: 1.5 }}>
+                ⚠️ Please confirm these billing modes match your real arrangement. Wrong
+                mode silently skews break-even and ROI.
+              </span>
+              <button
+                type="button"
+                onClick={() => setBillingConfirmed(true)}
+                style={{
+                  flexShrink: 0,
+                  border: 0,
+                  borderRadius: "6px",
+                  padding: "8px 14px",
+                  fontWeight: 700,
+                  fontSize: "0.85rem",
+                  color: "#fff",
+                  background: "#d97706",
+                  cursor: "pointer"
+                }}
+              >
+                Confirm
+              </button>
+            </div>
+          )}
+          {billingConfirmed && (
+            <p
+              style={{
+                margin: "-4px 0 14px",
+                fontSize: "0.82rem",
+                color: "#059669",
+                fontWeight: 700
+              }}
+            >
+              ✓ Billing modes confirmed
+            </p>
+          )}
+
+          <div style={{ borderTop: "1px solid #e5e7eb", paddingTop: "12px" }}>
+            <button
+              type="button"
+              onClick={() => setShowAdvancedSettings((current) => !current)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                border: 0,
+                background: "none",
+                color: "#1d4ed8",
+                fontWeight: 700,
+                fontSize: "0.85rem",
+                cursor: "pointer",
+                padding: 0,
+                marginBottom: showAdvancedSettings ? "14px" : 0
+              }}
+            >
+              <span style={{ display: "inline-block", transform: showAdvancedSettings ? "rotate(90deg)" : "none", transition: "transform 150ms ease" }}>
+                ▶
+              </span>
+              {showAdvancedSettings ? "Hide Advanced Settings" : "Need custom infrastructure? Advanced Settings"}
+            </button>
+
+            {showAdvancedSettings && (
+              <>
+                <p style={{ margin: "0 0 12px", fontSize: "0.82rem", color: "#64748b", lineHeight: 1.5 }}>
+                  Everything here is pre-filled with our recommended estimate. Only
+                  change a field if you have a real vendor quote or benchmark to
+                  replace it with.
+                </p>
+                <NumberField label="GPU cost" name="gpuCost" value={values.gpuCost} onChange={handleChange} prefix="$" />
+                <NumberField label="Hosting / electricity" name="hostingCost" value={values.hostingCost} onChange={handleChange} prefix="$" />
+                <NumberField label="Storage" name="storageCost" value={values.storageCost} onChange={handleChange} prefix="$" />
+                <NumberField label="Monitoring" name="monitoringCost" value={values.monitoringCost} onChange={handleChange} prefix="$" />
+                <NumberField label="Maintenance" name="maintenanceCost" value={values.maintenanceCost} onChange={handleChange} prefix="$" />
+                <NumberField label="Fine-tuning amortized" name="fineTuningCost" value={values.fineTuningCost} onChange={handleChange} prefix="$" />
+                <NumberField label="One-time setup cost" name="setupCost" value={values.setupCost} onChange={handleChange} prefix="$" />
+                <NumberField
+                  label="Target GPU utilization"
+                  name="targetGpuUtilization"
+                  value={values.targetGpuUtilization}
+                  onChange={handleChange}
+                  suffix="(0-1, default 0.4 works for most teams)"
+                />
+                <NumberField
+                  label="Reliability derating factor"
+                  name="reliabilityDeratingFactor"
+                  value={values.reliabilityDeratingFactor}
+                  onChange={handleChange}
+                  suffix="x (1.15-1.30 typical, estimate)"
+                />
+              </>
+            )}
+          </div>
         </section>
       </section>
 
       <section className="cards">
-        <article className="metric">
-          <span>Current API Cost</span>
+        <article className="metric metric-blue">
+          <div className="metricHead">
+            <span className="metricIcon"><DollarSign size={18} /></span>
+            <span>Current API Cost</span>
+          </div>
           <strong>{currency(result.apiCost)}</strong>
           <small>{(result.monthlyTokens / 1_000_000).toFixed(1)}M tokens/month</small>
         </article>
-        <article className="metric">
-          <span>Self-hosted Cost</span>
+        <article className="metric metric-purple">
+          <div className="metricHead">
+            <span className="metricIcon"><Server size={18} /></span>
+            <span>Self-hosted Cost</span>
+          </div>
           <strong>{currency(result.selfHostedCost)}</strong>
           <small>Infrastructure + maintenance</small>
         </article>
-        <article className="metric">
-          <span>Yearly Savings</span>
+        <article className="metric metric-green">
+          <div className="metricHead">
+            <span className="metricIcon"><TrendingDown size={18} /></span>
+            <span>Yearly Savings</span>
+          </div>
           <strong className={result.yearlySavings >= 0 ? "positive" : "negative"}>
             {currency(result.yearlySavings)}
           </strong>
-          <small>{result.roi.toFixed(1)}% monthly ROI</small>
+          <small>{result.annualRoiPercent.toFixed(1)}% annual ROI</small>
         </article>
-        <article className="metric">
-          <span>Recommended Model</span>
+        <article className="metric metric-amber">
+          <div className="metricHead">
+            <span className="metricIcon"><Brain size={18} /></span>
+            <span>Recommended Model</span>
+          </div>
           <strong>{result.recommendation.model}</strong>
           <small>{result.recommendation.hardware}</small>
+        </article>
+        <article className="metric metric-pink">
+          <div className="metricHead">
+            <span className="metricIcon"><Percent size={18} /></span>
+            <span>Cost Efficiency</span>
+          </div>
+          <strong className={result.monthlyCostEfficiencyRatio >= 0 ? "positive" : "negative"}>
+            {result.monthlyCostEfficiencyRatio.toFixed(1)}%
+          </strong>
+          <small>Savings per $ of monthly self-hosted spend (not ROI)</small>
         </article>
       </section>
 
@@ -752,7 +1177,6 @@ function App() {
           </div>
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={comparisonData}>
-              <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="name" />
               <YAxis />
               <Tooltip formatter={(value) => currency(value)} />
@@ -768,7 +1192,6 @@ function App() {
           </div>
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={projectionData}>
-              <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="month" />
               <YAxis />
               <Tooltip formatter={(value) => currency(value)} />
