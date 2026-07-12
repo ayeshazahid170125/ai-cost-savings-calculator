@@ -437,7 +437,7 @@ sample-usage.csv
 
 ## Known Limitations & Assumptions
 
-> ⚠️ **This calculator produces planning-grade estimates, not exact vendor quotations.** Every dollar figure it shows — API cost, self-hosted infra cost, ROI, break-even — is derived from illustrative pricing constants and usage assumptions listed below. Before using output in a client-facing proposal or procurement decision, validate the assumptions that matter most against real vendor quotes.
+>  **This calculator produces planning-grade estimates, not exact vendor quotations.** Every dollar figure it shows — API cost, self-hosted infra cost, ROI, break-even — is derived from illustrative pricing constants and usage assumptions listed below. Before using output in a client-facing proposal or procurement decision, validate the assumptions that matter most against real vendor quotes.
 
 - **Infrastructure-only cost model.** Excludes engineering/DevOps time, model retraining cadence as base models improve, and reliability/on-call cost. Disclosed in the PDF; not yet reflected as a line item in the cost formula.
 - **Pricing is manually maintained.** `input_token_price` / `output_token_price` are hardcoded per provider server-side. No automatic sync with provider pricing pages — stale pricing produces confidently wrong numbers. Mitigation: planned Admin Pricing Panel (see roadmap).
